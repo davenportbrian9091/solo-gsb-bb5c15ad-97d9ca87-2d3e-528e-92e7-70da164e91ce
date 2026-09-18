@@ -27,20 +27,27 @@ from .compressor import CompressionError, compress_instances
 from .conflicts import ConflictSegment, ConflictsError, Participant, find_conflicts
 from .diff import CalendarDiff, diff_calendars
 from .expander import ExpansionError, Instance, expand_calendar
+from .provenance import (
+    OccurrenceProvenance,
+    ProvenanceError,
+    occurrence_provenance,
+)
 from .validation import Issue, validate_ics
 
 UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.8.0",
+    version="1.9.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, intersect named calendars with "
     "local working hours to find common free time, find high-concurrency "
     "segments across named calendars, expand VALARM reminders, report "
     "per-instance ATTENDEE participation status inside a query window, "
     "compress a set of equal-length UTC instances into the shortest "
-    "recurrence ICS, and validate raw iCalendar text structurally.",
+    "recurrence ICS, validate raw iCalendar text structurally, and trace "
+    "the provenance (generation, exclusion, override) of every candidate "
+    "occurrence of one UID series.",
 )
 
 
@@ -216,6 +223,73 @@ class AttendanceResponse(BaseModel):
     window_end: dt.datetime
     count: int
     instances: list[AttendanceInstanceOut]
+
+    @field_serializer("window_start", "window_end")
+    def _serialize_window(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
+# ---------------------------------------------------------------------------
+# POST /provenance
+# ---------------------------------------------------------------------------
+
+
+class ProvenanceRequest(BaseModel):
+    ics: str = Field(..., description="iCalendar (RFC 5545) text to inspect")
+    window_start: dt.datetime = Field(
+        ..., description="Start of the query window (ISO 8601, converted to UTC)"
+    )
+    window_end: dt.datetime = Field(
+        ..., description="End of the query window (ISO 8601, converted to UTC)"
+    )
+    uid: str = Field(
+        ..., min_length=1, description="UID of the series to trace"
+    )
+
+
+class OccurrenceOut(BaseModel):
+    uid: str
+    recurrence_id: dt.datetime | None = Field(
+        ..., description="Original occurrence time (UTC); null for an "
+        "untouched non-recurring event"
+    )
+    source: str | None = Field(
+        ...,
+        description="How the candidate was generated: 'DTSTART', 'RRULE' or "
+        "'RDATE'; null for an override whose RECURRENCE-ID matches no "
+        "occurrence of the series",
+    )
+    excluded: bool = Field(
+        ..., description="An EXDATE removed this candidate occurrence"
+    )
+    override: str | None = Field(
+        ...,
+        description="RECURRENCE-ID override applied to this occurrence: "
+        "'RESCHEDULED' or 'CANCELLED'; null when no override targets it",
+    )
+    start: dt.datetime | None = Field(
+        ..., description="Final effective DTSTART (UTC); null when no "
+        "instance survives (excluded or cancelled)"
+    )
+    end: dt.datetime | None = Field(
+        ..., description="Final effective DTEND (UTC); null like start"
+    )
+    status: str | None = Field(
+        ..., description="Final effective STATUS; null only for an "
+        "EXDATEd occurrence without an override"
+    )
+
+    @field_serializer("recurrence_id", "start", "end")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _iso_z(value)
+
+
+class ProvenanceResponse(BaseModel):
+    uid: str
+    window_start: dt.datetime
+    window_end: dt.datetime
+    count: int
+    occurrences: list[OccurrenceOut]
 
     @field_serializer("window_start", "window_end")
     def _serialize_window(self, value: dt.datetime) -> str:
@@ -436,6 +510,19 @@ def _participant_out(participant: Participant) -> ParticipantOut:
     )
 
 
+def _occurrence_out(occurrence: OccurrenceProvenance) -> OccurrenceOut:
+    return OccurrenceOut(
+        uid=occurrence.uid,
+        recurrence_id=occurrence.recurrence_id,
+        source=occurrence.source,
+        excluded=occurrence.excluded,
+        override=occurrence.override,
+        start=occurrence.start,
+        end=occurrence.end,
+        status=occurrence.status,
+    )
+
+
 def _issue_out(issue: Issue) -> IssueOut:
     return IssueOut(
         code=issue.code,
@@ -644,6 +731,29 @@ def attendance(request: AttendanceRequest) -> AttendanceResponse:
         window_end=window_end,
         count=len(items),
         instances=[_attendance_instance_out(item) for item in items],
+    )
+
+
+@app.post("/provenance", response_model=ProvenanceResponse)
+def provenance(request: ProvenanceRequest) -> ProvenanceResponse:
+    window_start = _to_utc(request.window_start)
+    window_end = _to_utc(request.window_end)
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=422, detail="window_start must be before window_end"
+        )
+    try:
+        occurrences = occurrence_provenance(
+            request.ics, request.uid, window_start, window_end
+        )
+    except (ExpansionError, ProvenanceError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ProvenanceResponse(
+        uid=request.uid,
+        window_start=window_start,
+        window_end=window_end,
+        count=len(occurrences),
+        occurrences=[_occurrence_out(o) for o in occurrences],
     )
 
 

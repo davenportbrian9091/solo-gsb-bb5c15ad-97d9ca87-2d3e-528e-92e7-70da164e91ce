@@ -33,6 +33,11 @@ local working hours.
   override that declares any `ATTENDEE` replaces the whole list (one
   without keeps inheriting), with `PARTSTAT` counts and stable address
   ordering
+- `/provenance` traces, for one `UID` series, **why** each candidate
+  occurrence in the window did or did not survive expansion: `DTSTART`/
+  `RRULE`/`RDATE` generation, `EXDATE` exclusion, `RECURRENCE-ID`
+  reschedule or cancellation, and the final `DTSTART`/`DTEND`/`STATUS` —
+  the surviving records reconcile exactly with `/expand`
 - `/validate` structurally checks raw iCalendar text and always replies
   `200` — even unparsable input — with a sorted list of stable-coded
   diagnostics (missing `UID`/`DTSTART`, `DTEND` + `DURATION`, inverted
@@ -734,6 +739,120 @@ therefore replaces the entire list; `counts` follows each effective list:
 }
 ```
 
+### `POST /provenance`
+
+Traces the **provenance chain** of every candidate occurrence of one
+series (one `UID`) inside the query window — i.e. *why* each occurrence
+did or did not survive expansion. It reuses the exact recurrence engine
+behind `/expand` (same padded-window generation, `EXDATE` handling,
+override merging and `422`s), scoped to the requested `UID`. Request body:
+
+| Field          | Type   | Description                                        |
+| -------------- | ------ | -------------------------------------------------- |
+| `ics`          | string | iCalendar text (one or more `VEVENT`s)             |
+| `window_start` | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+| `window_end`   | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+| `uid`          | string | Non-empty `UID` of the series to trace             |
+
+Each entry of `occurrences` is one **candidate occurrence** and carries:
+
+| Field           | Type            | Description                                              |
+| --------------- | --------------- | -------------------------------------------------------- |
+| `uid`           | string          | The traced series UID                                    |
+| `recurrence_id` | string \| null   | Original occurrence time (UTC); `null` for an untouched non-recurring event |
+| `source`        | string \| null   | `DTSTART`, `RRULE` or `RDATE` — how the candidate was generated; `null` for an override whose `RECURRENCE-ID` no rule generates |
+| `excluded`      | boolean         | An `EXDATE` matched this candidate                       |
+| `override`      | string \| null   | `RESCHEDULED` or `CANCELLED` when a `RECURRENCE-ID` override targets the occurrence; `null` otherwise |
+| `start` / `end` | string \| null   | Final effective `DTSTART`/`DTEND` (UTC); `null` when no instance survives (excluded, or cancelled) |
+| `status`        | string \| null   | Final effective `STATUS`; `null` only for an `EXDATE`d occurrence without an override |
+
+Semantics:
+
+- A candidate is reported when its **original slot** or its **final
+  instance** overlaps `[window_start, window_end)` — so an occurrence
+  moved *out of* the window is still traced (with its out-of-window final
+  times), and an override moving an out-of-window occurrence *into* the
+  window appears too (its `source` is resolved against the series
+  definition, or `null` when the `RECURRENCE-ID` matches no occurrence).
+- When several mechanisms produce the same instant, the most specific
+  source wins: `DTSTART` over `RDATE` over `RRULE` (a `DTSTART` that
+  coincides with the first rule occurrence is reported as `DTSTART`).
+- An override has the last word on its occurrence, exactly as in
+  `/expand`: a rescheduling override even **resurrects** an `EXDATE`d
+  candidate (the record then shows `excluded: true` **and**
+  `override: "RESCHEDULED"` with the override's final times).
+- A cancelled master suppresses candidate generation (its recurrence
+  properties are never parsed, like `/expand`); its overrides are still
+  traced. A cancelled override needs no `DTSTART`.
+- Records are stably sorted by **final instance time** (candidates
+  without one sort by their original occurrence time), then
+  `recurrence_id`. The records with a non-null `start` are exactly the
+  instances `/expand` returns for the same window, in the same order.
+- Only the requested `UID`'s `VEVENT`s are parsed and validated; unrelated
+  events in the same calendar are ignored. An unknown `uid`, or a `uid`
+  with only `RECURRENCE-ID` overrides and no master event (no
+  `DTSTART`/`RRULE`/`RDATE` source), returns `422`.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/provenance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:weekly-1\r\nDTSTART;TZID=America/New_York:20260301T090000\r\nDTEND;TZID=America/New_York:20260301T100000\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\nEXDATE;TZID=America/New_York:20260308T090000\r\nSUMMARY:Weekly sync\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekly-1\r\nRECURRENCE-ID;TZID=America/New_York:20260315T090000\r\nDTSTART;TZID=America/New_York:20260316T110000\r\nDTEND;TZID=America/New_York:20260316T120000\r\nSUMMARY:Weekly sync (moved)\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    "window_start": "2026-02-25T00:00:00Z",
+    "window_end": "2026-04-01T00:00:00Z",
+    "uid": "weekly-1"
+  }'
+```
+
+The same calendar as the `/expand` example: the March 1 candidate comes
+from `DTSTART` itself, the March 8 candidate was `RRULE`-generated and
+removed by the `EXDATE` (finals are `null`), and the March 15 candidate
+was rescheduled by its override to March 16 — the two records with a
+non-null `start` are exactly what `/expand` returns:
+
+```json
+{
+  "uid": "weekly-1",
+  "window_start": "2026-02-25T00:00:00Z",
+  "window_end": "2026-04-01T00:00:00Z",
+  "count": 3,
+  "occurrences": [
+    {
+      "uid": "weekly-1",
+      "recurrence_id": "2026-03-01T14:00:00Z",
+      "source": "DTSTART",
+      "excluded": false,
+      "override": null,
+      "start": "2026-03-01T14:00:00Z",
+      "end": "2026-03-01T15:00:00Z",
+      "status": "CONFIRMED"
+    },
+    {
+      "uid": "weekly-1",
+      "recurrence_id": "2026-03-08T13:00:00Z",
+      "source": "RRULE",
+      "excluded": true,
+      "override": null,
+      "start": null,
+      "end": null,
+      "status": null
+    },
+    {
+      "uid": "weekly-1",
+      "recurrence_id": "2026-03-15T13:00:00Z",
+      "source": "RRULE",
+      "excluded": false,
+      "override": "RESCHEDULED",
+      "start": "2026-03-16T15:00:00Z",
+      "end": "2026-03-16T16:00:00Z",
+      "status": "CONFIRMED"
+    }
+  ]
+}
+```
+
 ### `POST /validate`
 
 Structurally validates iCalendar text and reports every problem found as a
@@ -974,6 +1093,16 @@ eagerly, so a conflict yields `422` even for events outside the window.
 Calendar-level failures (unparsable ICS, bad window, invalid recurrence,
 unknown `TZID`) reuse the `/expand` checks.
 
+`/provenance` returns `422` when the requested `uid` has no `VEVENT` in
+the calendar, when the series has no master event (only `RECURRENCE-ID`
+overrides — no `DTSTART`/`RRULE`/`RDATE` source to trace), when
+`window_start >= window_end`, or when the traced series itself fails any
+of the `/expand` checks (unparsable ICS, invalid `RRULE`, unknown
+`TZID`, missing `DTSTART`, unsupported `RECURRENCE-ID` range, more than
+10 000 occurrences in the window). A missing or empty `uid` request
+field is a schema `422`. Events of *other* UIDs are never inspected, so
+their problems cannot fail the request.
+
 `/validate` is the deliberate exception: it never returns `422` for
 calendar content. Unparsable text and malformed events are reported as
 `200` responses with one or more issues (a `parse_error` issue has null
@@ -1156,13 +1285,14 @@ uvicorn app.main:app --reload       # run locally on port 8000
 app/main.py          FastAPI app: POST /expand, POST /agenda, POST /alarms,
                      POST /attendance, POST /calendar-diff,
                      POST /availability, POST /conflicts, POST /validate,
-                     POST /compress-schedule, GET /health
+                     POST /compress-schedule, POST /provenance, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
 app/compressor.py    shortest ICS over DAILY/WEEKLY RRULE grids + RDATE fallback
 app/agenda.py        local-day agenda fragments, midnight splitting, DATE handling
 app/validation.py    structural VEVENT checks, stable issue codes, sorting
 app/alarms.py        VALARM parsing, REPEAT/DURATION fan-out, window filtering
 app/attendance.py    ATTENDEE inheritance, address normalization, PARTSTAT counts
+app/provenance.py    per-occurrence provenance: source, EXDATE, override, finals
 app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID
 app/availability.py  working-period timeline, busy clipping/merge, free complement
 app/conflicts.py     half-open sweep for minimum-concurrency segments
