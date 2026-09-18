@@ -6,6 +6,12 @@ time** across several named calendars when intersected with per-weekday
 local working hours.
 
 - Expands `DTSTART` + `RRULE` + `RDATE` − `EXDATE`
+- `/provenance` traces one series (`UID`) inside a window and returns each
+  candidate occurrence's chain: the authored `RRULE`/`RDATE`/`DTSTART`
+  sources that generate it, every matching `EXDATE`, the `RECURRENCE-ID`
+  override that reschedules/modifies/cancels it, and the final effective
+  `DTSTART`/`DTEND`/`STATUS` — including candidates removed by `EXDATE` or
+  cancellation, stably sorted by effective instance time
 - Merges overrides by `UID` + `RECURRENCE-ID`: an override can **reschedule**
   an instance (judged against the window by its *actual* new start/end; the
   original slot is never kept) or **cancel** it via `STATUS:CANCELLED`
@@ -110,6 +116,121 @@ the new time (the original slot is gone):
       "start": "2026-03-16T15:00:00Z",
       "end": "2026-03-16T16:00:00Z",
       "status": "CONFIRMED"
+    }
+  ]
+}
+```
+
+### `POST /provenance`
+
+Explain **where every candidate occurrence of one series comes from**. The
+request takes the same `ics` and UTC window as `/expand`, plus the `uid` of
+one `VEVENT` series; other `UID`s in the calendar are ignored.
+
+| Field          | Type   | Description                                        |
+| -------------- | ------ | -------------------------------------------------- |
+| `ics`          | string | iCalendar text (one or more `VEVENT`s)             |
+| `window_start` | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+| `window_end`   | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+| `uid`          | string | `UID` of the series to trace (non-empty)           |
+
+Each element of `occurrences` is one candidate occurrence of the series,
+stably sorted by its effective instance time (final `start`, else the
+scheduled slot), then `RECURRENCE-ID`:
+
+- `recurrence_id` — the occurrence's scheduled slot in UTC (its identity);
+- `generated_by` — authored sources generating the slot, in canonical
+  order `RRULE` (with the unfolded rule text in `rrule`), `RDATE`, then
+  `DTSTART` alone (an `RDATE` duplicating an `RRULE` hit lists both; the
+  `DTSTART` seed of a ruled series is covered by the rule and not repeated);
+- `excluded_by` — UTC instants of every `EXDATE` matching the slot
+  (`TZID`-local values are normalized); a stray `EXDATE` that names no
+  generated slot is not an occurrence;
+- `override` — the `RECURRENCE-ID` component applied to the slot, with
+  `action` `RESCHEDULED` (non-cancelled, new start), `MODIFIED`
+  (non-cancelled, same start — e.g. an end-time or summary edit) or
+  `CANCELLED`, plus the override's own start/end/status;
+- `scheduled_start`/`scheduled_end` — the slot the series generates
+  (`null` only for an override whose `RECURRENCE-ID` the master never
+  generates);
+- `final_start`/`final_end`/`final_status` — the effective values after
+  every transformation. They equal the scheduled values for an untouched
+  occurrence; an `EXDATE` exclusion leaves all three `null`; a `CANCELLED`
+  master or override yields `final_status: "CANCELLED"` with null times;
+  an override at an `EXDATEd` slot still wins, so the chain records both
+  the exclusion and the final values.
+
+A candidate is included when **either** its scheduled slot **or** its
+final slot overlaps `[window_start, window_end)`: an occurrence moved out
+of the window keeps its chain (visible via the scheduled slot), and an
+occurrence moved into the window from a slot the series never generates
+appears with an empty `generated_by`. The window and calendar validation
+of `/expand` is reused unchanged, and a `uid` absent from the calendar
+returns `422`.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/provenance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:weekly-1\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\nEXDATE:20260112T090000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekly-1\r\nRECURRENCE-ID:20260119T090000Z\r\nDTSTART:20260120T110000Z\r\nDTEND:20260120T120000Z\r\nSUMMARY:moved\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    "uid": "weekly-1",
+    "window_start": "2026-01-01T00:00:00Z",
+    "window_end": "2026-02-01T00:00:00Z"
+  }'
+```
+
+Response — Jan 5 survives unchanged, Jan 12 is reported *with* its
+generation source despite being `EXDATE`d (`final_*` null), and Jan 19
+keeps its scheduled slot while the override produces the final instance
+on Jan 20:
+
+```json
+{
+  "uid": "weekly-1",
+  "window_start": "2026-01-01T00:00:00Z",
+  "window_end": "2026-02-01T00:00:00Z",
+  "count": 3,
+  "occurrences": [
+    {
+      "recurrence_id": "2026-01-05T09:00:00Z",
+      "generated_by": [{"kind": "RRULE", "rrule": "FREQ=WEEKLY;COUNT=3"}],
+      "excluded_by": [],
+      "override": null,
+      "scheduled_start": "2026-01-05T09:00:00Z",
+      "scheduled_end": "2026-01-05T10:00:00Z",
+      "final_start": "2026-01-05T09:00:00Z",
+      "final_end": "2026-01-05T10:00:00Z",
+      "final_status": "CONFIRMED"
+    },
+    {
+      "recurrence_id": "2026-01-12T09:00:00Z",
+      "generated_by": [{"kind": "RRULE", "rrule": "FREQ=WEEKLY;COUNT=3"}],
+      "excluded_by": ["2026-01-12T09:00:00Z"],
+      "override": null,
+      "scheduled_start": "2026-01-12T09:00:00Z",
+      "scheduled_end": "2026-01-12T10:00:00Z",
+      "final_start": null,
+      "final_end": null,
+      "final_status": null
+    },
+    {
+      "recurrence_id": "2026-01-19T09:00:00Z",
+      "generated_by": [{"kind": "RRULE", "rrule": "FREQ=WEEKLY;COUNT=3"}],
+      "excluded_by": [],
+      "override": {
+        "action": "RESCHEDULED",
+        "recurrence_id": "2026-01-19T09:00:00Z",
+        "start": "2026-01-20T11:00:00Z",
+        "end": "2026-01-20T12:00:00Z",
+        "status": "CONFIRMED"
+      },
+      "scheduled_start": "2026-01-19T09:00:00Z",
+      "scheduled_end": "2026-01-19T10:00:00Z",
+      "final_start": "2026-01-20T11:00:00Z",
+      "final_end": "2026-01-20T12:00:00Z",
+      "final_status": "CONFIRMED"
     }
   ]
 }
@@ -948,6 +1069,12 @@ recurrence, unknown `TZID`).
 returns `422` when `window_start >= window_end` or when either `old_ics` or
 `new_ics` fails any of the `/expand` checks above.
 
+`/provenance` reuses the calendar and window validation of `/expand`
+(unparsable ICS, invalid recurrence, unknown `TZID`,
+`window_start >= window_end`, the 10 000-occurrence cap) and additionally
+returns `422` when `uid` is missing/empty or no `VEVENT` with that `UID`
+exists in the supplied calendar.
+
 `/agenda` additionally returns `422` for an unknown display `timezone`
 (non-IANA name) and reuses the calendar and window validation of `/expand`
 (unparsable ICS, invalid recurrence, unknown `TZID`,
@@ -1003,6 +1130,39 @@ The endpoints accepts unsorted input; instances are sorted internally.
 - `RDATE`/`EXDATE` support `DATE` and `DATE-TIME` values (not `PERIOD`);
   `RECURRENCE-ID` with `RANGE=THISANDFUTURE` is not supported.
 - A master event with `STATUS:CANCELLED` suppresses its whole series.
+
+### Provenance semantics
+
+- **Same engine as `/expand`**: occurrence generation, the
+  duration-padded window frame, floating-time/DST handling, `EXDATE`
+  matching and the 10 000-occurrence cap are reused from the expander, so
+  the scheduled candidates never drift from `/expand`. Occurrences removed
+  by `EXDATE` are re-added to the candidate set from the authored
+  `EXDATE` values inside the padded frame purely to report their chain;
+  an `EXDATE` that names no generated slot is never a candidate.
+- **Generation sources** list every authored property producing the slot,
+  in the canonical order `RRULE` (rule text unfolded), `RDATE`, then
+  `DTSTART` alone (the seed of an `RDATE`-only or non-recurring event).
+  An `RDATE` duplicating an `RRULE` instance lists both; the `DTSTART`
+  covered by an `RRULE` is not repeated. An orphan override's
+  `RECURRENCE-ID` outside the padded frame is checked against each rule by
+  a point membership lookup, so a generated slot moved into the window
+  keeps its `RRULE` source even past the frame edge.
+- **Overrides** mirror `/expand` keyed by `UID` + `RECURRENCE-ID` (the
+  last component for one RID wins). A non-cancelled override is
+  `RESCHEDULED` when its start differs from the scheduled slot and
+  `MODIFIED` otherwise; a `STATUS:CANCELLED` override is `CANCELLED`. An
+  override at an `EXDATEd` slot wins in `/expand` and here too, while the
+  matching `EXDATE` stays visible in `excluded_by`.
+- **Final values**: equal to the scheduled values for an untouched
+  occurrence; all null for an unresurrected `EXDATE`;
+  `final_status: "CANCELLED"` with null times for a cancelled master or
+  override; the override's own start/end/status after a reschedule/modify.
+- **Inclusion and order**: a candidate is returned when its scheduled slot
+  *or* its final slot overlaps the half-open window (the same moved-in /
+  moved-out judgment as `/expand`, applied per occurrence). Entries sort
+  by effective instance time (final start, else scheduled start) and then
+  `RECURRENCE-ID`, which is stable for equal times.
 
 ### Alarm semantics
 
@@ -1153,11 +1313,14 @@ uvicorn app.main:app --reload       # run locally on port 8000
 ## Project layout
 
 ```
-app/main.py          FastAPI app: POST /expand, POST /agenda, POST /alarms,
+app/main.py          FastAPI app: POST /expand, POST /provenance,
+                     POST /agenda, POST /alarms,
                      POST /attendance, POST /calendar-diff,
                      POST /availability, POST /conflicts, POST /validate,
                      POST /compress-schedule, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
+app/provenance.py    per-occurrence provenance chains (RRULE/RDATE/DTSTART
+                     generation, EXDATE, RECURRENCE-ID override, final values)
 app/compressor.py    shortest ICS over DAILY/WEEKLY RRULE grids + RDATE fallback
 app/agenda.py        local-day agenda fragments, midnight splitting, DATE handling
 app/validation.py    structural VEVENT checks, stable issue codes, sorting
